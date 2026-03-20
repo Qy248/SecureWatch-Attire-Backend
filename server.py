@@ -1,5 +1,5 @@
 # server.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Header, Depends, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Header, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, PlainTextResponse, JSONResponse
 from collections import deque
@@ -4717,3 +4717,26 @@ async def attire_notifications_stream(request: Request, token: str = ""):
         media_type="text/event-stream",
         headers=sse_headers,
     )
+
+@app.get("/api/attire/notifications/stream")
+async def notifications_stream(token: str = Query(...)):
+    # validate token
+    user = get_current_user_from_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    q = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    with ATTIRE_NOTIF_SUBS_LOCK:
+        ATTIRE_NOTIF_SUBS.add((loop, q))
+
+    async def event_generator():
+        try:
+            while True:
+                payload = await q.get()
+                yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            with ATTIRE_NOTIF_SUBS_LOCK:
+                ATTIRE_NOTIF_SUBS.discard((loop, q))
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
