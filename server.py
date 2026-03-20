@@ -3770,14 +3770,26 @@ def export_attire_pdf(
     video_id: str = "",
 ):
     import io
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
+        from reportlab.lib.colors import HexColor
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import cm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+            KeepTogether,
+        )
+        from reportlab.graphics.shapes import Drawing, String, Rect
+        from reportlab.graphics.charts.barcharts import VerticalBarChart
+        from reportlab.graphics.charts.linecharts import HorizontalLineChart
+        from reportlab.graphics.charts.piecharts import Pie
     except Exception:
         raise HTTPException(status_code=501, detail="reportlab not installed")
 
@@ -3870,36 +3882,172 @@ def export_attire_pdf(
         except Exception:
             return "-"
 
-    def _label_title(label: str) -> str:
-        s = str(label or "").lower()
-        if "sleeveless" in s:
+    def _label_title_local(label: str) -> str:
+        s0 = str(label or "").lower()
+        if "sleeveless" in s0:
             return "Sleeveless"
-        if "shorts" in s:
+        if "shorts" in s0:
             return "Shorts"
-        if s == "slippers" or "sandal" in s:
+        if s0 == "slippers" or "sandal" in s0:
             return "Slippers"
         return str(label or "Unknown").replace("_", " ").title()
 
     def _format_location(e: dict) -> str:
-        # Match frontend as closely as possible:
-        # source name first, then view/location
-        src_name = (
-            e.get("video_name")
-            or e.get("video_id")
-            or "Unknown"
-        )
-
-        view_name = (
-            e.get("view")
-            or e.get("location")
-            or "normal"
-        )
-
+        src_name = e.get("video_name") or e.get("video_id") or "Unknown"
+        view_name = e.get("view") or e.get("location") or "normal"
         return f"{src_name}, {view_name}"
+
+    def _chart_card(title: str, drawing: Drawing):
+        title_para = Paragraph(title, ParagraphStyle(
+            f"{title}_style",
+            parent=styles["Heading3"],
+            fontName="Helvetica-Bold",
+            fontSize=10.5,
+            textColor=HexColor("#0F172A"),
+            spaceAfter=6,
+        ))
+        card = Table(
+            [[title_para], [drawing]],
+            colWidths=[doc.width],
+        )
+        card.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), HexColor("#F8FAFC")),
+            ("BOX", (0, 0), (-1, -1), 0.8, HexColor("#CBD5E1")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        return card
+
+    def _empty_chart(width: float, height: float, text: str = "No data available"):
+        d = Drawing(width, height)
+        d.add(Rect(0, 0, width, height, fillColor=HexColor("#F8FAFC"), strokeColor=HexColor("#E2E8F0")))
+        d.add(String(width / 2.0, height / 2.0, text, textAnchor="middle", fontName="Helvetica", fontSize=11, fillColor=HexColor("#64748B")))
+        return d
+
+    def _build_bar_chart(data):
+        width = doc.width - 20
+        height = 180
+
+        if not data:
+            return _empty_chart(width, height)
+
+        d = Drawing(width, height)
+        chart = VerticalBarChart()
+        chart.x = 40
+        chart.y = 28
+        chart.width = width - 60
+        chart.height = height - 50
+        chart.data = [[int(x.get("count", 0) or 0) for x in data]]
+        chart.categoryAxis.categoryNames = [str(x.get("name", "")) for x in data]
+        chart.valueAxis.valueMin = 0
+        chart.valueAxis.forceZero = 1
+        chart.barWidth = 18
+        chart.groupSpacing = 12
+        chart.barSpacing = 6
+        chart.strokeColor = HexColor("#CBD5E1")
+        chart.categoryAxis.labels.angle = 0
+        chart.categoryAxis.labels.fontName = "Helvetica"
+        chart.categoryAxis.labels.fontSize = 8
+        chart.categoryAxis.labels.fillColor = HexColor("#475569")
+        chart.valueAxis.labels.fontName = "Helvetica"
+        chart.valueAxis.labels.fontSize = 8
+        chart.valueAxis.labels.fillColor = HexColor("#475569")
+        chart.categoryAxis.strokeColor = HexColor("#94A3B8")
+        chart.valueAxis.strokeColor = HexColor("#94A3B8")
+        chart.bars[0].fillColor = HexColor("#F97316")
+        chart.bars[0].strokeColor = HexColor("#EA580C")
+        d.add(chart)
+        return d
+
+    def _build_daily_trend_chart(events_list):
+        width = doc.width - 20
+        height = 180
+
+        # same idea as frontend: last 8 days ending at selected end date
+        try:
+            end_dt = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
+        except Exception:
+            end_dt = datetime.now()
+        end_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        counts = {}
+        for e in events_list:
+            try:
+                dt = datetime.fromtimestamp(int(e.get("ts", 0) or 0)).replace(hour=0, minute=0, second=0, microsecond=0)
+                key = dt.strftime("%Y-%m-%d")
+                counts[key] = counts.get(key, 0) + 1
+            except Exception:
+                pass
+
+        labels = []
+        values = []
+        for i in range(7, -1, -1):
+            d0 = end_dt - timedelta(days=i)
+            key = d0.strftime("%Y-%m-%d")
+            labels.append(d0.strftime("%m-%d"))
+            values.append(int(counts.get(key, 0)))
+
+        if not any(values):
+            return _empty_chart(width, height)
+
+        d = Drawing(width, height)
+        chart = HorizontalLineChart()
+        chart.x = 40
+        chart.y = 28
+        chart.width = width - 60
+        chart.height = height - 50
+        chart.data = [values]
+        chart.categoryAxis.categoryNames = labels
+        chart.valueAxis.valueMin = 0
+        chart.valueAxis.forceZero = 1
+        chart.joinedLines = 1
+        chart.lines[0].strokeColor = HexColor("#EF4444")
+        chart.lines[0].strokeWidth = 2
+        chart.lines[0].symbol = None
+        chart.categoryAxis.labels.fontName = "Helvetica"
+        chart.categoryAxis.labels.fontSize = 8
+        chart.categoryAxis.labels.fillColor = HexColor("#475569")
+        chart.valueAxis.labels.fontName = "Helvetica"
+        chart.valueAxis.labels.fontSize = 8
+        chart.valueAxis.labels.fillColor = HexColor("#475569")
+        chart.categoryAxis.strokeColor = HexColor("#94A3B8")
+        chart.valueAxis.strokeColor = HexColor("#94A3B8")
+        d.add(chart)
+        return d
+
+    def _build_status_pie(resolved_count: int, pending_count: int):
+        width = doc.width - 20
+        height = 200
+
+        total = int(resolved_count) + int(pending_count)
+        if total <= 0:
+            return _empty_chart(width, height)
+
+        d = Drawing(width, height)
+        pie = Pie()
+        pie.x = (width - 130) / 2.0
+        pie.y = 30
+        pie.width = 130
+        pie.height = 130
+        pie.data = [int(resolved_count), int(pending_count)]
+        pie.labels = [
+            f"Resolved ({resolved_count})",
+            f"Pending ({pending_count})",
+        ]
+        pie.slices.strokeWidth = 0.5
+        pie.slices[0].fillColor = HexColor("#10B981")
+        pie.slices[1].fillColor = HexColor("#EF4444")
+        pie.slices[0].strokeColor = HexColor("#0F766E")
+        pie.slices[1].strokeColor = HexColor("#B91C1C")
+        pie.sideLabels = True
+        pie.simpleLabels = False
+        d.add(pie)
+        return d
 
     story = []
 
-    # Title
     story.append(Paragraph("Attire Compliance Report", title_style))
     story.append(
         Paragraph(
@@ -3914,7 +4062,6 @@ def export_attire_pdf(
         )
     )
 
-    # Summary cards
     card_label = ParagraphStyle(
         "CardLabel",
         parent=styles["Normal"],
@@ -3970,11 +4117,9 @@ def export_attire_pdf(
             ]
         )
     )
-
     story.append(cards)
     story.append(Spacer(1, 10))
 
-    # Most frequent violation
     story.append(Paragraph("Most Frequent Violation", h2_style))
     badge = Table(
         [[P(most_frequent, ParagraphStyle(
@@ -4002,6 +4147,21 @@ def export_attire_pdf(
     story.append(badge)
     story.append(Spacer(1, 12))
 
+    # --- Charts section: RIGHT BELOW TITLE/SUMMARY, BEFORE TABLE ---
+    freq_data = r.get("charts", {}).get("type_frequency", []) or []
+    bar_chart = _build_bar_chart(freq_data)
+    trend_chart = _build_daily_trend_chart(events)
+    pie_chart = _build_status_pie(resolved, pending)
+
+    story.append(KeepTogether([
+        _chart_card("Violation Type Frequency", bar_chart),
+        Spacer(1, 8),
+        _chart_card("Last 8 Days Trend", trend_chart),
+        Spacer(1, 8),
+        _chart_card("Status Distribution", pie_chart),
+        Spacer(1, 12),
+    ]))
+
     # Historical Violations table
     story.append(Paragraph("Historical Violations", h2_style))
 
@@ -4016,18 +4176,16 @@ def export_attire_pdf(
 
     for e in events[:200]:
         rows.append([
-            _label_title(e.get("label", "")),
+            _label_title_local(e.get("label", "")),
             _format_location(e),
             str(e.get("status", "Pending") or "Pending"),
             _fmt_dt(e.get("ts", 0)),
             _fmt_dt(e.get("resolved_ts")) if e.get("resolved_ts") else "-",
         ])
 
-    # width distribution matching frontend meaning
     col_fracs = [0.16, 0.38, 0.12, 0.17, 0.17]
     col_widths = [doc.width * f for f in col_fracs]
 
-    # paragraphify
     rows[0] = [P(f"<b>{h}</b>", header_left) for h in rows[0]]
 
     for i in range(1, len(rows)):
