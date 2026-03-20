@@ -987,7 +987,7 @@ with NOTIF_LOCK:
 
 # --- Notification publish / SSE ---
 ATTIRE_NOTIF_SUBS_LOCK = threading.Lock()
-ATTIRE_NOTIF_SUBS = set()  # set of asyncio.Queue
+ATTIRE_NOTIF_SUBS = set()  # set of (loop, asyncio.Queue)
 
 # per (source_id, violation_type) cooldown
 ATTIRE_NOTIF_LAST_TS_LOCK = threading.Lock()
@@ -1012,15 +1012,30 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
     return True
 
 def _publish_attire_notification(payload: dict) -> None:
-    # payload must be JSON serializable
+    # Called from worker threads, so must notify asyncio loop thread-safely
     with ATTIRE_NOTIF_SUBS_LOCK:
         subs = list(ATTIRE_NOTIF_SUBS)
 
-    for q in subs:
+    for loop, q in subs:
+        try:
+            loop.call_soon_threadsafe(_safe_notif_put, q, payload)
+        except Exception:
+            pass
+
+def _safe_notif_put(q: asyncio.Queue, payload: dict):
+    try:
+        q.put_nowait(payload)
+    except asyncio.QueueFull:
+        try:
+            _ = q.get_nowait()   # drop oldest one
+        except Exception:
+            pass
         try:
             q.put_nowait(payload)
         except Exception:
             pass
+    except Exception:
+        pass
 
 # ----------------------------
 # In-memory runtime stores
@@ -4391,13 +4406,14 @@ async def attire_notifications_stream(token: str = ""):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     q: asyncio.Queue = asyncio.Queue(maxsize=50)
+    loop = asyncio.get_running_loop()
+    sub = (loop, q)
 
     with ATTIRE_NOTIF_SUBS_LOCK:
-        ATTIRE_NOTIF_SUBS.add(q)
+        ATTIRE_NOTIF_SUBS.add(sub)
 
     async def gen():
         try:
-            # first hello / config push
             with NOTIF_LOCK:
                 cfg = dict(ATTIRE_NOTIF_CFG)
             yield f"event: config\ndata: {json.dumps(cfg)}\n\n"
@@ -4407,10 +4423,17 @@ async def attire_notifications_stream(token: str = ""):
                     item = await asyncio.wait_for(q.get(), timeout=15.0)
                     yield f"event: notify\ndata: {json.dumps(item)}\n\n"
                 except asyncio.TimeoutError:
-                    # keepalive
                     yield "event: ping\ndata: {}\n\n"
         finally:
             with ATTIRE_NOTIF_SUBS_LOCK:
-                ATTIRE_NOTIF_SUBS.discard(q)
+                ATTIRE_NOTIF_SUBS.discard(sub)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
