@@ -1,7 +1,7 @@
 # server.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Header, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response, PlainTextResponse
+from fastapi.responses import StreamingResponse, Response, PlainTextResponse, JSONResponse
 from collections import deque
 from pathlib import Path
 from datetime import datetime
@@ -23,6 +23,14 @@ from fisheye_multiview_dewarp import (
     VIEW_CONFIGS,
 )
 
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://qy248.github.io",
+]
+
 app = FastAPI()
 
 HERE = Path(__file__).resolve().parent
@@ -31,17 +39,47 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://qy248.github.io",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+@app.middleware("http")
+async def force_cors_headers(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    try:
+        response = await call_next(request)
+    except Exception:
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
+        )
+
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Vary"] = "Origin"
+
+    return response
+
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str, request: Request):
+    origin = request.headers.get("origin", "")
+    headers = {}
+
+    if origin in ALLOWED_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Access-Control-Allow-Methods"] = "*"
+        headers["Access-Control-Allow-Headers"] = "*"
+        headers["Vary"] = "Origin"
+
+    return Response(status_code=204, headers=headers)
 
 @app.get("/health")
 def render_health():
@@ -4418,7 +4456,10 @@ def delete_user(user_id: str, admin: dict = Depends(require_admin)):
 @app.get("/api/attire/notifications")
 def get_attire_notifications_cfg(user=Depends(get_current_user)):
     with NOTIF_LOCK:
-        return {"config": ATTIRE_NOTIF_CFG}
+        return JSONResponse(
+            content={"config": ATTIRE_NOTIF_CFG},
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
 
 @app.post("/api/attire/notifications")
 def set_attire_notifications_cfg(payload: dict = Body(...), user=Depends(get_current_user)):
@@ -4444,7 +4485,7 @@ def set_attire_notifications_cfg(payload: dict = Body(...), user=Depends(get_cur
 
 # --- SSE ---
 @app.get("/api/attire/notifications/stream")
-async def attire_notifications_stream(token: str = ""):
+async def attire_notifications_stream(request: Request, token: str = ""):
     user = get_current_user_from_token(token)
     if not user:
         print("[NOTIF] SSE rejected: invalid token")
@@ -4460,36 +4501,49 @@ async def attire_notifications_stream(token: str = ""):
         ATTIRE_NOTIF_SUBS.add(sub)
         print("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
 
-        async def gen():
-            try:
-                with NOTIF_LOCK:
-                    cfg = dict(ATTIRE_NOTIF_CFG)
+    async def gen():
+        try:
+            with NOTIF_LOCK:
+                cfg = dict(ATTIRE_NOTIF_CFG)
 
-                # optional initial config event
-                yield f"event: config\ndata: {json.dumps(cfg)}\n\n"
+            # send initial config event
+            yield f"event: config\ndata: {json.dumps(cfg)}\n\n"
 
-                while True:
-                    try:
-                        item = await asyncio.wait_for(q.get(), timeout=15.0)
-                        print("[NOTIF] SSE sending plain message:", item)
+            while True:
+                if await request.is_disconnected():
+                    print("[NOTIF] SSE client disconnected")
+                    break
 
-                        # send as NORMAL SSE message (not custom notify event)
-                        yield f"data: {json.dumps(item)}\n\n"
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=10.0)
+                    print("[NOTIF] SSE sending plain message:", item)
+                    yield f"data: {json.dumps(item)}\n\n"
 
-                    except asyncio.TimeoutError:
-                        print("[NOTIF] SSE sending ping")
-                        # comment line only, keeps connection alive
-                        yield ": ping\n\n"
-            finally:
-                with ATTIRE_NOTIF_SUBS_LOCK:
-                    ATTIRE_NOTIF_SUBS.discard(sub)
+                except asyncio.TimeoutError:
+                    print("[NOTIF] SSE sending ping")
+                    yield ": ping\n\n"
+
+        finally:
+            with ATTIRE_NOTIF_SUBS_LOCK:
+                ATTIRE_NOTIF_SUBS.discard(sub)
+                print("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
+
+    origin = request.headers.get("origin", "")
+    sse_headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    if origin in ALLOWED_ORIGINS:
+        sse_headers["Access-Control-Allow-Origin"] = origin
+        sse_headers["Access-Control-Allow-Credentials"] = "true"
+        sse_headers["Access-Control-Allow-Methods"] = "*"
+        sse_headers["Access-Control-Allow-Headers"] = "*"
+        sse_headers["Vary"] = "Origin"
 
     return StreamingResponse(
         gen(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=sse_headers,
     )
