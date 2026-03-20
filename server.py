@@ -493,6 +493,123 @@ with ATTIRE_EVENTS_LOCK:
     ATTIRE_EVENTS = _load_attire_events_file()
 
 # ----------------------------
+# Persistent Store: Data Retention
+# ----------------------------
+RETENTION_PATH = str(HERE / "attire_retention.json")
+RETENTION_LOCK = threading.Lock()
+
+DEFAULT_RETENTION_CFG = {
+    "retention_days": 7,   # allowed 1..7
+}
+
+ATTIRE_RETENTION_CFG = DEFAULT_RETENTION_CFG.copy()
+
+def _load_retention_file() -> dict:
+    try:
+        if os.path.exists(RETENTION_PATH):
+            with open(RETENTION_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _save_retention_file(data: dict) -> None:
+    try:
+        tmp = RETENTION_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, RETENTION_PATH)
+    except Exception:
+        pass
+
+with RETENTION_LOCK:
+    loaded = _load_retention_file()
+    ATTIRE_RETENTION_CFG = {**DEFAULT_RETENTION_CFG, **loaded}
+
+def _get_retention_days() -> int:
+    with RETENTION_LOCK:
+        days = int(ATTIRE_RETENTION_CFG.get("retention_days", 7) or 7)
+    return max(1, min(7, days))
+
+def _safe_remove_file(path: str) -> None:
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+def _event_evidence_abs_path(ev: dict) -> str:
+    url = str(ev.get("evidence_url") or "").strip()
+    if not url.startswith("/violations/"):
+        return ""
+    rel = url[len("/violations/"):].strip("/")
+    if not rel:
+        return ""
+    return os.path.join(VIOLATIONS_DIR, rel)
+
+def _prune_attire_events_by_retention() -> int:
+    """
+    Remove expired attire events and their evidence files based on retention_days.
+    Returns number of deleted events.
+    """
+    cutoff_ts = int(time.time()) - (_get_retention_days() * 24 * 3600)
+    removed = []
+
+    with ATTIRE_EVENTS_LOCK:
+        if not ATTIRE_EVENTS:
+            return 0
+
+        kept = []
+        for ev in ATTIRE_EVENTS:
+            ts = int(ev.get("ts", 0) or 0)
+            if ts < cutoff_ts:
+                removed.append(ev)
+            else:
+                kept.append(ev)
+
+        if len(kept) == len(ATTIRE_EVENTS):
+            return 0
+
+        ATTIRE_EVENTS[:] = kept
+        _save_attire_events_file(ATTIRE_EVENTS)
+
+    for ev in removed:
+        _safe_remove_file(_event_evidence_abs_path(ev))
+
+    return len(removed)
+
+def _clear_all_attire_events_and_evidence() -> dict:
+    removed_count = 0
+
+    with ATTIRE_EVENTS_LOCK:
+        removed_count = len(ATTIRE_EVENTS)
+        ATTIRE_EVENTS[:] = []
+        _save_attire_events_file(ATTIRE_EVENTS)
+
+    # remove all evidence folders for attire
+    for sub in ("live", "offline", "rtsp"):
+        subdir = os.path.join(VIOLATIONS_DIR, sub)
+        try:
+            if os.path.isdir(subdir):
+                shutil.rmtree(subdir, ignore_errors=True)
+            os.makedirs(subdir, exist_ok=True)
+        except Exception:
+            pass
+
+    # reset runtime dedupe / cooldown states too
+    with LIVE_EVENT_STATE_LOCK:
+        LIVE_EVENT_STATE.clear()
+
+    with ATTIRE_NOTIF_LAST_TS_LOCK:
+        ATTIRE_NOTIF_LAST_TS.clear()
+
+    with TRACKS_LOCK:
+        TRACKS_BY_VIEW.clear()
+
+    return {"ok": True, "cleared_events": removed_count}
+
+# ----------------------------
 # Universal Live Event Writer
 # ----------------------------
 LIVE_EVENT_STATE_LOCK = threading.Lock()
@@ -520,7 +637,8 @@ def _write_attire_event_common(
 ):
     now_s = int(time.time())
     key = _live_event_key(source_id, view_name or "normal", label, track_id)
-
+    _prune_attire_events_by_retention()
+    
     with LIVE_EVENT_STATE_LOCK:
         st = LIVE_EVENT_STATE.get(key) or {"count": 0, "last_ts": 0}
 
@@ -1166,6 +1284,7 @@ VIOLATIONS_DIR = str(HERE / "violations")
 os.makedirs(VIOLATIONS_DIR, exist_ok=True)
 # Serve saved evidence images (front-end can load via http://localhost:8000/violations/...)
 app.mount("/violations", StaticFiles(directory=VIOLATIONS_DIR), name="violations")
+_prune_attire_events_by_retention()
 
 # ----------------------------
 # Helpers 
@@ -2586,6 +2705,8 @@ class LiveVideoSession:
 # ----------------------------
 @app.get("/api/attire/events")
 def get_attire_events(video_id: str = "", limit: int = 200):
+    _prune_attire_events_by_retention()
+
     with ATTIRE_EVENTS_LOCK:
         items = list(ATTIRE_EVENTS)
 
@@ -2599,14 +2720,24 @@ def get_attire_events(video_id: str = "", limit: int = 200):
 
 @app.delete("/api/attire/events")
 def clear_attire_events(video_id: str = ""):
+    if not video_id:
+        return _clear_all_attire_events_and_evidence()
+
+    removed = []
     with ATTIRE_EVENTS_LOCK:
-        if video_id:
-            kept = [e for e in ATTIRE_EVENTS if e.get("video_id") != video_id]
-            ATTIRE_EVENTS[:] = kept
-        else:
-            ATTIRE_EVENTS[:] = []
+        kept = []
+        for ev in ATTIRE_EVENTS:
+            if ev.get("video_id") == video_id:
+                removed.append(ev)
+            else:
+                kept.append(ev)
+        ATTIRE_EVENTS[:] = kept
         _save_attire_events_file(ATTIRE_EVENTS)
-    return {"ok": True}
+
+    for ev in removed:
+        _safe_remove_file(_event_evidence_abs_path(ev))
+
+    return {"ok": True, "cleared_events": len(removed), "video_id": video_id}
 
 @app.patch("/api/attire/events/{event_id}")
 def patch_attire_event(event_id: str, body: dict = Body(...)):
@@ -3614,11 +3745,44 @@ def set_attire_violation_types(body: dict = Body(...)):
     return {"ok": True, "enabled": cleaned}
 
 # ----------------------------
+# API: Data Retention
+# ----------------------------
+@app.get("/api/attire/data-retention")
+def get_attire_data_retention():
+    _prune_attire_events_by_retention()
+    return {
+        "retention_days": _get_retention_days()
+    }
+
+@app.post("/api/attire/data-retention")
+def set_attire_data_retention(body: dict = Body(...)):
+    days = int(body.get("retention_days", 7) or 7)
+    days = max(1, min(7, days))
+
+    with RETENTION_LOCK:
+        ATTIRE_RETENTION_CFG["retention_days"] = days
+        _save_retention_file(ATTIRE_RETENTION_CFG)
+
+    pruned = _prune_attire_events_by_retention()
+
+    return {
+        "ok": True,
+        "retention_days": days,
+        "pruned_events": pruned,
+    }
+
+@app.delete("/api/attire/data-retention/events")
+def clear_all_attire_events():
+    result = _clear_all_attire_events_and_evidence()
+    return result
+
+# ----------------------------
 # API: Dashboard
 # ----------------------------
 @app.get("/api/attire/dashboard")
 def attire_dashboard():
     now = int(time.time())
+    _prune_attire_events_by_retention()
     since_24h = now - 24 * 3600
     since_7d  = now - 7 * 24 * 3600
 
@@ -3756,6 +3920,7 @@ def attire_reports(
     video_id: str = "",
     limit: int = 1000,
 ):
+    _prune_attire_events_by_retention()
     start_dt = _parse_yyyy_mm_dd(start) if start else None
     end_dt = _parse_yyyy_mm_dd(end) if end else None
     if end_dt:
@@ -3835,6 +4000,7 @@ def attire_reports(
 
 @app.get("/api/attire/reports/export.csv")
 def export_attire_csv(start: str = "", end: str = "", vtype: str = "All", status: str = "All", video_id: str = ""):
+    _prune_attire_events_by_retention()
     r = attire_reports(start=start, end=end, vtype=vtype, status=status, video_id=video_id, limit=100000)
     events = r["events"]
 
@@ -3865,6 +4031,7 @@ def export_attire_csv(start: str = "", end: str = "", vtype: str = "All", status
 def export_attire_pdf(
     payload: dict = Body(default={})
 ):
+    _prune_attire_events_by_retention()
     import io
     import base64
     from datetime import datetime
