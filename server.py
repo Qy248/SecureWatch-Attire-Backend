@@ -29,6 +29,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://qy248.github.io",
+    "https://jinxuan-wong.github.io",
 ]
 
 app = FastAPI()
