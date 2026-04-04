@@ -1,3 +1,4 @@
 {
+  "enabled": true,
   "retention_days": 7
 }

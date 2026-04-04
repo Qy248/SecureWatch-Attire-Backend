@@ -766,7 +766,7 @@ def _write_attire_event_live(
         frame_bgr=frame_bgr,
         bbox_xyxy=bbox_xyxy,
         track_id=track_id,
-        source_type="Live Detection",
+        source_type="Webcam",
         evidence_kind="live",
         id_prefix="live",
     )
@@ -796,6 +796,30 @@ def _write_attire_event_offline(
         id_prefix="offline",
     )
 
+def _write_attire_event_rtsp(
+    *,
+    rtsp_id: str,
+    rtsp_name: str,
+    view_name: str,
+    label: str,
+    conf: float,
+    frame_bgr,
+    bbox_xyxy,
+    track_id=None,
+):
+    return _write_attire_event_common(
+        source_id=rtsp_id,
+        source_name=rtsp_name,
+        view_name=view_name,
+        label=label,
+        conf=conf,
+        frame_bgr=frame_bgr,
+        bbox_xyxy=bbox_xyxy,
+        track_id=track_id,
+        source_type="Live RTSP",
+        evidence_kind="rtsp",
+        id_prefix="rtsp",
+    )
 # ----------------------------
 # Persistent Store: Video Display Names
 # ----------------------------
@@ -2672,16 +2696,28 @@ class LiveVideoSession:
                                             if person_bbox is not None:
                                                 track_id = _assign_light_track_id(self.video_id, vname, person_bbox)
 
-                                            _write_attire_event_offline(
-                                                video_id=self.video_id,
-                                                video_name=self.video_name,
-                                                view_name=vname,
-                                                label=vio_label,
-                                                conf=float(info["conf"]),
-                                                frame_bgr=frame_use,
-                                                bbox_xyxy=bbox_use,
-                                                track_id=track_id,
-                                            )
+                                            if is_rtsp:
+                                                _write_attire_event_rtsp(
+                                                    rtsp_id=self.video_id,
+                                                    rtsp_name=self.video_name,
+                                                    view_name=vname,
+                                                    label=vio_label,
+                                                    conf=float(info["conf"]),
+                                                    frame_bgr=frame_use,
+                                                    bbox_xyxy=bbox_use,
+                                                    track_id=track_id,
+                                                )
+                                            else:
+                                                _write_attire_event_offline(
+                                                    video_id=self.video_id,
+                                                    video_name=self.video_name,
+                                                    view_name=vname,
+                                                    label=vio_label,
+                                                    conf=float(info["conf"]),
+                                                    frame_bgr=frame_use,
+                                                    bbox_xyxy=bbox_use,
+                                                    track_id=track_id,
+                                                )
                                         except Exception as e:
                                             print("[offline event] failed:", repr(e))
 

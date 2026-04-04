@@ -78,7 +78,7 @@
     "enabled": false
   },
   "cam201": {
-    "enabled": false
+    "enabled": true
   },
   "vid-dfe79abe": {
     "enabled": true
