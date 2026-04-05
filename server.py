@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional, Set, Tuple, List
 import numpy as np
 import threading, time, queue
 import cv2, json
+import math
 cv2.setNumThreads(1)
 import os, uuid, shutil, sys, traceback, csv, io, asyncio
 import base64, hashlib, hmac, secrets
@@ -30,6 +31,7 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "https://qy248.github.io",
     "https://jinxuan-wong.github.io",
+    "https://c9e92d69.securewatch.pages.dev",
 ]
 
 app = FastAPI()
@@ -105,6 +107,12 @@ EVIDENCE_PAD_MIN = 20
 EVIDENCE_VIEW_SHAPE = (1080, 1920)
 
 GLOBAL_PERSON_DETECTOR = None
+
+DEBUG_NOTIF = False
+
+def _dprint(*args, **kwargs):
+    if DEBUG_NOTIF:
+        print(*args, **kwargs)
 # ----------------------------
 # Lightweight event-time tracking (person_id)
 # ----------------------------
@@ -693,6 +701,275 @@ def _clear_all_attire_events_and_evidence() -> dict:
 LIVE_EVENT_STATE_LOCK = threading.Lock()
 LIVE_EVENT_STATE = {}  # key -> {"count": int, "last_ts": int}
 
+# ----------------------------
+# Duplicate event suppression (lightweight image similarity)
+# ----------------------------
+DUPLICATE_TIME_WINDOW_SEC = 20
+DUPLICATE_SIMILARITY_THRESHOLD = 0.80
+DUPLICATE_INDEX_MAX_PER_BUCKET = 8
+DUPLICATE_INDEX_TTL_SEC = 180
+DUPLICATE_CLEANUP_INTERVAL_SEC = 45
+DUPLICATE_CLEANUP_LOOKBACK_SEC = 120
+
+ATTIRE_DUPLICATE_INDEX_LOCK = threading.Lock()
+ATTIRE_DUPLICATE_INDEX = {}  # bucket_key -> list[entry]
+
+def _duplicate_bucket_key(source_id: str, view_name: str, label: str, track_id=None):
+    if track_id is not None:
+        return f"{source_id}|{view_name or 'normal'}|{label}|trk:{track_id}"
+    return f"{source_id}|{view_name or 'normal'}|{label}"
+
+def _build_crop_evidence_whole_person(img_bgr, bbox, label):
+    if img_bgr is None or getattr(img_bgr, "size", 0) == 0 or bbox is None:
+        return None
+
+    h, w = img_bgr.shape[:2]
+    x1, y1, x2, y2 = map(float, bbox)
+
+    x1 = float(_clamp(x1, 0, w - 1)); x2 = float(_clamp(x2, 0, w - 1))
+    y1 = float(_clamp(y1, 0, h - 1)); y2 = float(_clamp(y2, 0, h - 1))
+
+    bw = max(2.0, x2 - x1)
+    bh = max(2.0, y2 - y1)
+
+    lab = (label or "").lower()
+    if lab == "slippers":
+        up_mul, down_mul, side_mul = 10.0, 1.5, 3.0
+        anchor_bottom = True
+    elif lab == "shorts":
+        up_mul, down_mul, side_mul = 6.0, 2.0, 3.0
+        anchor_bottom = False
+    elif lab == "sleeveless":
+        up_mul, down_mul, side_mul = 2.0, 6.0, 3.0
+        anchor_bottom = False
+    else:
+        up_mul, down_mul, side_mul = 4.0, 3.0, 3.0
+        anchor_bottom = False
+
+    cx = (x1 + x2) * 0.5
+    if anchor_bottom:
+        Y2 = y2 + bh * down_mul
+        target_h = bh * (up_mul + down_mul)
+        Y1 = Y2 - target_h
+    else:
+        Y1 = y1 - bh * up_mul
+        Y2 = y2 + bh * down_mul
+
+    X1 = cx - (bw * side_mul * 0.5)
+    X2 = cx + (bw * side_mul * 0.5)
+
+    X1 = int(_clamp(X1, 0, w - 1)); X2 = int(_clamp(X2, 0, w - 1))
+    Y1 = int(_clamp(Y1, 0, h - 1)); Y2 = int(_clamp(Y2, 0, h - 1))
+
+    if X2 <= X1 + 2 or Y2 <= Y1 + 2:
+        crop = img_bgr
+    else:
+        crop = img_bgr[Y1:Y2, X1:X2]
+        if crop is None or crop.size == 0:
+            crop = img_bgr
+
+    if crop is None or crop.size == 0:
+        return None
+    return crop
+
+def _compute_difference_hash_uint64(img_bgr, size: int = 16) -> int:
+    if img_bgr is None or getattr(img_bgr, "size", 0) == 0:
+        return 0
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if len(img_bgr.shape) == 3 else img_bgr
+    resized = cv2.resize(gray, (size + 1, size), interpolation=cv2.INTER_AREA)
+    diff = resized[:, 1:] > resized[:, :-1]
+
+    value = 0
+    for bit in diff.flatten():
+        value = (value << 1) | int(bool(bit))
+    return int(value)
+
+def _hash_similarity_ratio(a: int, b: int, size: int = 16) -> float:
+    bits = size * size
+    x = int(a) ^ int(b)
+    try:
+        dist = x.bit_count()
+    except AttributeError:
+        dist = bin(x).count("1")
+    return max(0.0, 1.0 - (dist / float(bits)))
+
+def _event_bbox_area(ev: dict) -> float:
+    bbox = ev.get("bbox_xyxy") or []
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return 0.0
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+def _merge_duplicate_event_fields(existing: dict, *, new_conf, new_ts: int, similarity: float, bbox_xyxy, evidence_url: str = "") -> dict:
+    out = dict(existing)
+    out["last_seen_ts"] = int(new_ts)
+    out["duplicate_hits"] = int(out.get("duplicate_hits", 0) or 0) + 1
+    out["max_similarity"] = max(float(out.get("max_similarity", 0.0) or 0.0), float(similarity or 0.0))
+    out["last_conf"] = float(new_conf) if new_conf is not None else out.get("last_conf")
+
+    old_conf = out.get("conf")
+    old_conf = float(old_conf) if old_conf is not None else -1.0
+    new_conf_f = float(new_conf) if new_conf is not None else -1.0
+
+    old_area = _event_bbox_area(out)
+    new_area = 0.0
+    if isinstance(bbox_xyxy, (list, tuple)) and len(bbox_xyxy) == 4:
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        new_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    should_upgrade = (new_conf_f > old_conf + 1e-6) or ((abs(new_conf_f - old_conf) <= 1e-6) and (new_area > old_area))
+
+    if should_upgrade:
+        out["conf"] = float(new_conf) if new_conf is not None else out.get("conf")
+        if evidence_url:
+            out["evidence_url"] = evidence_url
+        if isinstance(bbox_xyxy, (list, tuple)) and len(bbox_xyxy) == 4:
+            out["bbox_xyxy"] = [float(v) for v in bbox_xyxy]
+
+    return out
+
+def _prune_duplicate_index(now_ts: float = None) -> None:
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    with ATTIRE_DUPLICATE_INDEX_LOCK:
+        dead = []
+        for key, arr in ATTIRE_DUPLICATE_INDEX.items():
+            kept = [it for it in (arr or []) if (now_ts - float(it.get("ts", 0.0))) <= float(DUPLICATE_INDEX_TTL_SEC)]
+            if kept:
+                ATTIRE_DUPLICATE_INDEX[key] = kept[-DUPLICATE_INDEX_MAX_PER_BUCKET:]
+            else:
+                dead.append(key)
+        for key in dead:
+            ATTIRE_DUPLICATE_INDEX.pop(key, None)
+
+def _find_duplicate_recent_event(source_id: str, view_name: str, label: str, track_id, crop_hash: int, now_s: int):
+    bucket = _duplicate_bucket_key(source_id, view_name, label, track_id)
+    _prune_duplicate_index(now_s)
+    with ATTIRE_DUPLICATE_INDEX_LOCK:
+        entries = list(ATTIRE_DUPLICATE_INDEX.get(bucket) or [])
+
+    best = None
+    best_sim = 0.0
+    for entry in reversed(entries):
+        age = now_s - int(entry.get("ts", 0) or 0)
+        if age > int(DUPLICATE_TIME_WINDOW_SEC):
+            continue
+        sim = _hash_similarity_ratio(crop_hash, int(entry.get("hash", 0) or 0))
+        if sim >= float(DUPLICATE_SIMILARITY_THRESHOLD) and sim > best_sim:
+            best = entry
+            best_sim = sim
+
+    if best is None:
+        return None
+    return {"event_id": best.get("event_id"), "similarity": float(best_sim), "bucket": bucket}
+
+def _remember_duplicate_index(source_id: str, view_name: str, label: str, track_id, crop_hash: int, now_s: int, event_id: str):
+    bucket = _duplicate_bucket_key(source_id, view_name, label, track_id)
+    entry = {"event_id": event_id, "hash": int(crop_hash), "ts": int(now_s)}
+    with ATTIRE_DUPLICATE_INDEX_LOCK:
+        arr = list(ATTIRE_DUPLICATE_INDEX.get(bucket) or [])
+        arr.append(entry)
+        ATTIRE_DUPLICATE_INDEX[bucket] = arr[-DUPLICATE_INDEX_MAX_PER_BUCKET:]
+
+def _dedupe_recent_attire_events_periodic() -> int:
+    cutoff = int(time.time()) - int(DUPLICATE_CLEANUP_LOOKBACK_SEC)
+    removed = []
+
+    with ATTIRE_EVENTS_LOCK:
+        events = _load_all_attire_events()
+        if not events:
+            return 0
+
+        recent = [dict(e) for e in events if int(e.get("ts", 0) or 0) >= cutoff]
+        if len(recent) < 2:
+            return 0
+
+        id_to_event = {str(e.get("id")): dict(e) for e in events}
+        group_keepers = {}
+
+        recent_sorted = sorted(recent, key=lambda e: int(e.get("ts", 0) or 0))
+        for ev in recent_sorted:
+            if ev.get("status") == "Resolved":
+                continue
+            img_path = _event_evidence_abs_path(ev)
+            if not img_path or not os.path.isfile(img_path):
+                continue
+
+            img = cv2.imread(img_path)
+            if img is None or img.size == 0:
+                continue
+            crop_hash = _compute_difference_hash_uint64(img)
+
+            bucket = _duplicate_bucket_key(
+                str(ev.get("video_id") or ""),
+                str(ev.get("view") or ev.get("location") or "normal"),
+                str(ev.get("label") or ""),
+                ev.get("person_id"),
+            )
+            ts = int(ev.get("ts", 0) or 0)
+
+            matched_keeper = None
+            matched_sim = 0.0
+            for keeper in reversed(group_keepers.get(bucket, [])):
+                if abs(ts - int(keeper.get("ts", 0) or 0)) > int(DUPLICATE_TIME_WINDOW_SEC):
+                    continue
+                sim = _hash_similarity_ratio(crop_hash, int(keeper.get("hash", 0) or 0))
+                if sim >= float(DUPLICATE_SIMILARITY_THRESHOLD):
+                    matched_keeper = keeper
+                    matched_sim = sim
+                    break
+
+            if matched_keeper is None:
+                group_keepers.setdefault(bucket, []).append({
+                    "id": str(ev.get("id")),
+                    "hash": crop_hash,
+                    "ts": ts,
+                })
+                continue
+
+            keeper_id = str(matched_keeper["id"])
+            keeper_ev = dict(id_to_event.get(keeper_id) or {})
+            if keeper_ev:
+                merged = _merge_duplicate_event_fields(
+                    keeper_ev,
+                    new_conf=ev.get("conf"),
+                    new_ts=ts,
+                    similarity=matched_sim,
+                    bbox_xyxy=ev.get("bbox_xyxy"),
+                    evidence_url=ev.get("evidence_url") or "",
+                )
+                id_to_event[keeper_id] = merged
+            removed.append(ev)
+
+        if not removed:
+            return 0
+
+        removed_ids = {str(ev.get("id")) for ev in removed}
+        kept = []
+        for ev in events:
+            eid = str(ev.get("id"))
+            if eid in removed_ids:
+                continue
+            kept.append(id_to_event.get(eid, ev))
+
+        _rewrite_all_attire_events(kept)
+
+    for ev in removed:
+        _safe_remove_file(_event_evidence_abs_path(ev))
+
+    return len(removed)
+
+def _duplicate_cleanup_worker():
+    while True:
+        time.sleep(max(10.0, float(DUPLICATE_CLEANUP_INTERVAL_SEC)))
+        try:
+            _prune_duplicate_index()
+            removed = _dedupe_recent_attire_events_periodic()
+            if removed:
+                print(f"[DEDUP] removed {removed} duplicate attire event(s)")
+        except Exception as e:
+            print(f"[DEDUP] periodic cleanup failed: {e}")
+
 def _live_event_key(source_id: str, view: str, label: str, track_id=None):
     # RTSP future: if you have tracker, include track_id for best dedupe
     if track_id is not None:
@@ -756,12 +1033,58 @@ def _write_attire_event_common(
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
+    crop_img = None
     try:
-        _save_crop_evidence_whole_person(frame_bgr, bbox_xyxy, label, out_path)
+        crop_img = _build_crop_evidence_whole_person(frame_bgr, bbox_xyxy, label)
+        if crop_img is None or getattr(crop_img, "size", 0) == 0:
+            crop_img = frame_bgr
+        cv2.imwrite(out_path, crop_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     except Exception:
+        crop_img = frame_bgr
         cv2.imwrite(out_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
+    crop_hash = _compute_difference_hash_uint64(crop_img)
+    duplicate_hit = _find_duplicate_recent_event(
+        source_id,
+        view_name or "normal",
+        label,
+        track_id,
+        crop_hash,
+        now_s
+    )
+
     evidence_url = f"/violations/{evidence_kind}/{source_id}/{shard_folder}/{filename}"
+
+    if duplicate_hit is not None:
+        with ATTIRE_EVENTS_LOCK:
+            items = _load_all_attire_events()
+            idx = next(
+                (i for i, e in enumerate(items) if str(e.get("id")) == str(duplicate_hit.get("event_id"))),
+                None
+            )
+            if idx is not None:
+                ev = dict(items[idx])
+                merged = _merge_duplicate_event_fields(
+                    ev,
+                    new_conf=conf,
+                    new_ts=now_s,
+                    similarity=float(duplicate_hit.get("similarity", 0.0) or 0.0),
+                    bbox_xyxy=bbox_xyxy,
+                    evidence_url=evidence_url,
+                )
+                items[idx] = merged
+                _rewrite_all_attire_events(items)
+                _remember_duplicate_index(
+                    source_id,
+                    view_name or "normal",
+                    label,
+                    track_id,
+                    crop_hash,
+                    now_s,
+                    str(merged.get("id"))
+                )
+                _safe_remove_file(out_path)
+                return None
 
     new_event = {
         "id": f"{id_prefix}-{source_id}-{uuid.uuid4().hex[:8]}",
@@ -770,6 +1093,9 @@ def _write_attire_event_common(
         "label": label,
         "view": view_name or "normal",
         "ts": now_s,
+        "last_seen_ts": now_s,
+        "duplicate_hits": 0,
+        "max_similarity": 0.0,
         "conf": float(conf) if conf is not None else None,
         "severity": "High",
         "evidence_url": evidence_url,
@@ -779,15 +1105,25 @@ def _write_attire_event_common(
         "notes": "",
         "source": source_type,
         "person_id": track_id,
+        "bbox_xyxy": [float(v) for v in bbox_xyxy] if isinstance(bbox_xyxy, (list, tuple)) and len(bbox_xyxy) == 4 else None,
     }
 
     with ATTIRE_EVENTS_LOCK:
         new_event = _append_attire_event(new_event)
+        _remember_duplicate_index(
+            source_id,
+            view_name or "normal",
+            label,
+            track_id,
+            crop_hash,
+            now_s,
+            str(new_event.get("id"))
+        )
         # Publish notification (rate-limited)
         try:
             sid = new_event.get("video_id") or "unknown"
             vtype = new_event.get("label") or "unknown"
-            print("[NOTIF] event created:",
+            _dprint("[NOTIF] event created:",
                 "id=", new_event.get("id"),
                 "video_id=", new_event.get("video_id"),
                 "label=", new_event.get("label"),
@@ -795,7 +1131,7 @@ def _write_attire_event_common(
 
             ok_notif = _should_publish_notif(sid, vtype)
 
-            print("[NOTIF] should_publish =",
+            _dprint("[NOTIF] should_publish =",
                 ok_notif,
                 "sid=", sid,
                 "type=", vtype)
@@ -804,7 +1140,7 @@ def _write_attire_event_common(
                 with ATTIRE_NOTIF_SUBS_LOCK:
                     sub_count = len(ATTIRE_NOTIF_SUBS)
 
-                print("[NOTIF] publishing to subscribers:", sub_count)
+                _dprint("[NOTIF] publishing to subscribers:", sub_count)
 
                 payload = {
                     "id": new_event["id"],
@@ -815,11 +1151,11 @@ def _write_attire_event_common(
                     "event_id": new_event["id"],
                 }
 
-                print("[NOTIF] payload:", payload)
+                _dprint("[NOTIF] payload:", payload)
 
                 _publish_attire_notification(payload)
             else:
-                print("[NOTIF] notification suppressed",
+                _dprint("[NOTIF] notification suppressed",
                     "sid=", sid,
                     "type=", vtype)
         except Exception:
@@ -1292,13 +1628,13 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
     with NOTIF_LOCK:
         cfg = dict(ATTIRE_NOTIF_CFG)
 
-    print("[NOTIF] _should_publish_notif called",
+    _dprint("[NOTIF] _should_publish_notif called",
           "source_id=", source_id,
           "violation_type=", violation_type,
           "cfg=", cfg)
 
     if not cfg.get("enabled", True):
-        print("[NOTIF] blocked: notifications disabled")
+        _dprint("[NOTIF] blocked: notifications disabled")
         return False
 
     cd = float(cfg.get("cooldown_sec", 30) or 0)
@@ -1309,7 +1645,7 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
         last = ATTIRE_NOTIF_LAST_TS.get(key, 0.0)
         diff = now - last
 
-        print("[NOTIF] cooldown check",
+        _dprint("[NOTIF] cooldown check",
               "key=", key,
               "last=", last,
               "now=", now,
@@ -1317,12 +1653,12 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
               "cooldown=", cd)
 
         if cd > 0 and diff < cd:
-            print("[NOTIF] blocked by cooldown")
+            _dprint("[NOTIF] blocked by cooldown")
             return False
 
         ATTIRE_NOTIF_LAST_TS[key] = now
 
-    print("[NOTIF] allowed")
+    _dprint("[NOTIF] allowed")
     return True
 
 def _publish_attire_notification(payload: dict) -> None:
@@ -1390,6 +1726,7 @@ def _janitor():
 
 # Start janitor once at import/startup
 threading.Thread(target=_janitor, daemon=True).start()
+threading.Thread(target=_duplicate_cleanup_worker, daemon=True).start()
 
 GLOBAL_DETECTOR = None
 # NOTE: ATTIRE_EVENTS is loaded from attire_events.json above.
@@ -1902,64 +2239,11 @@ def _match_person_bbox_for_violation(hi_view_bgr, vio_bbox_hi, scale=0.5) -> Opt
 
 def _save_crop_evidence_whole_person(img_bgr, bbox, label, out_path):
     """
-    Save a clearer evidence crop that tries to include the whole person,
-    based on where the violation usually appears.
-
-    This runs ONLY when an event is fired, so it won't affect live performance much.
+    Save a clearer evidence crop that tries to include the whole person.
     """
-    h, w = img_bgr.shape[:2]
-    x1, y1, x2, y2 = map(float, bbox)
-
-    # clamp bbox
-    x1 = float(_clamp(x1, 0, w - 1)); x2 = float(_clamp(x2, 0, w - 1))
-    y1 = float(_clamp(y1, 0, h - 1)); y2 = float(_clamp(y2, 0, h - 1))
-
-    bw = max(2.0, x2 - x1)
-    bh = max(2.0, y2 - y1)
-
-    lab = (label or "").lower()
-
-    # ---- label-aware expansion ----
-    # slippers: bbox is near feet -> extend A LOT upward
-    # shorts: bbox is mid-lower body -> extend upward a lot, slightly down
-    # sleeveless: bbox is upper body -> extend down more
-    if lab == "slippers":
-        up_mul, down_mul, side_mul = 10.0, 1.5, 3.0
-        anchor_bottom = True
-    elif lab == "shorts":
-        up_mul, down_mul, side_mul = 6.0, 2.0, 3.0
-        anchor_bottom = False
-    elif lab == "sleeveless":
-        up_mul, down_mul, side_mul = 2.0, 6.0, 3.0
-        anchor_bottom = False
-    else:
-        up_mul, down_mul, side_mul = 4.0, 3.0, 3.0
-        anchor_bottom = False
-
-    # build expanded crop
-    cx = (x1 + x2) * 0.5
-    if anchor_bottom:
-        # keep feet near bottom of crop
-        Y2 = y2 + bh * down_mul
-        target_h = bh * (up_mul + down_mul)
-        Y1 = Y2 - target_h
-    else:
-        Y1 = y1 - bh * up_mul
-        Y2 = y2 + bh * down_mul
-
-    X1 = cx - (bw * side_mul * 0.5)
-    X2 = cx + (bw * side_mul * 0.5)
-
-    # clamp crop
-    X1 = int(_clamp(X1, 0, w - 1)); X2 = int(_clamp(X2, 0, w - 1))
-    Y1 = int(_clamp(Y1, 0, h - 1)); Y2 = int(_clamp(Y2, 0, h - 1))
-
-    if X2 <= X1 + 2 or Y2 <= Y1 + 2:
+    crop = _build_crop_evidence_whole_person(img_bgr, bbox, label)
+    if crop is None or getattr(crop, "size", 0) == 0:
         crop = img_bgr
-    else:
-        crop = img_bgr[Y1:Y2, X1:X2]
-        if crop is None or crop.size == 0:
-            crop = img_bgr
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
@@ -2832,6 +3116,7 @@ class LiveVideoSession:
 @app.get("/api/attire/events")
 def get_attire_events(video_id: str = "", limit: int = 1000):
     _prune_attire_events_by_retention()
+    _dedupe_recent_attire_events_periodic()
 
     with ATTIRE_EVENTS_LOCK:
         items = _load_all_attire_events()
@@ -2895,16 +3180,22 @@ def patch_attire_event(event_id: str, body: dict = Body(...)):
 @app.delete("/api/attire/events/{event_id}")
 def delete_attire_event(event_id: str):
     """Delete a single event by id. Persists to attire_events.json."""
+    removed = None
     with ATTIRE_EVENTS_LOCK:
         items = _load_all_attire_events()
-        before = len(items)
-        items = [e for e in items if str(e.get("id")) != event_id]
-        after = len(items)
+        kept = []
+        for e in items:
+            if str(e.get("id")) == event_id:
+                removed = e
+            else:
+                kept.append(e)
 
-        if after == before:
+        if removed is None:
             raise HTTPException(status_code=404, detail="event not found")
 
-        _rewrite_all_attire_events(items)
+        _rewrite_all_attire_events(kept)
+
+    _safe_remove_file(_event_evidence_abs_path(removed))
     return {"ok": True, "deleted": event_id}
 
 # ----------------------------
@@ -3186,13 +3477,9 @@ def rtsp_stream(
     with LIVE_LOCK:
         sess = LIVE_SESSIONS.get(rtsp_id)
         if not sess:
-            return {
-                "ts": int(time.time()),
-                "fps": 0,
-                "resolution": [0, 0],
-                "detections": [],
-                "detail": "No active RTSP session"
-            }
+            _ensure_live_slot(rtsp_id)
+            sess = LiveVideoSession(rtsp_id, url, stream_fps=stream_fps, detect_fps=detect_fps)
+            LIVE_SESSIONS[rtsp_id] = sess
         else:
             fps_changed = (float(sess.stream_fps) != float(stream_fps)) or (float(sess.detect_fps) != float(detect_fps))
             sess.stream_fps = stream_fps
@@ -4793,10 +5080,10 @@ def set_attire_notifications_cfg(payload: dict = Body(...), user=Depends(get_cur
 async def attire_notifications_stream(request: Request, token: str = ""):
     user = get_current_user_from_token(token)
     if not user:
-        print("[NOTIF] SSE rejected: invalid token")
+        _dprint("[NOTIF] SSE rejected: invalid token")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    print("[NOTIF] SSE connect attempt by user:", user.get("username") if isinstance(user, dict) else user)
+    _dprint("[NOTIF] SSE connect attempt by user:", user.get("username") if isinstance(user, dict) else user)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=50)
     loop = asyncio.get_running_loop()
@@ -4804,7 +5091,7 @@ async def attire_notifications_stream(request: Request, token: str = ""):
 
     with ATTIRE_NOTIF_SUBS_LOCK:
         ATTIRE_NOTIF_SUBS.add(sub)
-        print("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
+        _dprint("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
 
     async def gen():
         try:
@@ -4816,22 +5103,22 @@ async def attire_notifications_stream(request: Request, token: str = ""):
 
             while True:
                 if await request.is_disconnected():
-                    print("[NOTIF] SSE client disconnected")
+                    _dprint("[NOTIF] SSE client disconnected")
                     break
 
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=10.0)
-                    print("[NOTIF] SSE sending plain message:", item)
+                    _dprint("[NOTIF] SSE sending plain message:", item)
                     yield f"data: {json.dumps(item)}\n\n"
 
                 except asyncio.TimeoutError:
-                    print("[NOTIF] SSE sending ping")
+                    _dprint("[NOTIF] SSE sending ping")
                     yield ": ping\n\n"
 
         finally:
             with ATTIRE_NOTIF_SUBS_LOCK:
                 ATTIRE_NOTIF_SUBS.discard(sub)
-                print("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
+                _dprint("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
 
     origin = request.headers.get("origin", "")
     sse_headers = {
@@ -4853,25 +5140,3 @@ async def attire_notifications_stream(request: Request, token: str = ""):
         headers=sse_headers,
     )
 
-@app.get("/api/attire/notifications/stream")
-async def notifications_stream(token: str = Query(...)):
-    # validate token
-    user = get_current_user_from_token(token)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    q = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-    with ATTIRE_NOTIF_SUBS_LOCK:
-        ATTIRE_NOTIF_SUBS.add((loop, q))
-
-    async def event_generator():
-        try:
-            while True:
-                payload = await q.get()
-                yield f"data: {json.dumps(payload)}\n\n"
-        finally:
-            with ATTIRE_NOTIF_SUBS_LOCK:
-                ATTIRE_NOTIF_SUBS.discard((loop, q))
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
