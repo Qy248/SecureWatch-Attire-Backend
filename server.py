@@ -706,8 +706,8 @@ LIVE_EVENT_STATE = {}  # key -> {"count": int, "last_ts": int}
 # ----------------------------
 # Duplicate event suppression (lightweight image similarity)
 # ----------------------------
-DUPLICATE_TIME_WINDOW_SEC = 120
-DUPLICATE_SIMILARITY_THRESHOLD = 0.80
+DUPLICATE_TIME_WINDOW_SEC = 180
+DUPLICATE_SIMILARITY_THRESHOLD = 0.70
 DUPLICATE_INDEX_MAX_PER_BUCKET = 8
 DUPLICATE_INDEX_TTL_SEC = 180
 DUPLICATE_CLEANUP_INTERVAL_SEC = 45
