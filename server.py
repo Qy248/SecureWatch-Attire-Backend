@@ -11,6 +11,7 @@ import numpy as np
 import threading, time, queue
 import cv2, json
 import math
+import psutil
 cv2.setNumThreads(1)
 import os, uuid, shutil, sys, traceback, csv, io, asyncio
 import base64, hashlib, hmac, secrets
@@ -35,6 +36,12 @@ ALLOWED_ORIGINS = [
 ]
 
 app = FastAPI()
+try:
+    p = psutil.Process(os.getpid())
+    p.nice(psutil.HIGH_PRIORITY_CLASS)
+    print("[ATTIRE] process priority set to HIGH")
+except Exception as e:
+    print("[ATTIRE] failed to set process priority:", e)
 
 HERE = Path(__file__).resolve().parent
 UPLOAD_DIR = str(HERE / "uploads")
@@ -108,11 +115,6 @@ EVIDENCE_VIEW_SHAPE = (1080, 1920)
 
 GLOBAL_PERSON_DETECTOR = None
 
-DEBUG_NOTIF = False
-
-def _dprint(*args, **kwargs):
-    if DEBUG_NOTIF:
-        print(*args, **kwargs)
 # ----------------------------
 # Lightweight event-time tracking (person_id)
 # ----------------------------
@@ -704,7 +706,7 @@ LIVE_EVENT_STATE = {}  # key -> {"count": int, "last_ts": int}
 # ----------------------------
 # Duplicate event suppression (lightweight image similarity)
 # ----------------------------
-DUPLICATE_TIME_WINDOW_SEC = 20
+DUPLICATE_TIME_WINDOW_SEC = 120
 DUPLICATE_SIMILARITY_THRESHOLD = 0.80
 DUPLICATE_INDEX_MAX_PER_BUCKET = 8
 DUPLICATE_INDEX_TTL_SEC = 180
@@ -1123,7 +1125,7 @@ def _write_attire_event_common(
         try:
             sid = new_event.get("video_id") or "unknown"
             vtype = new_event.get("label") or "unknown"
-            _dprint("[NOTIF] event created:",
+            print("[NOTIF] event created:",
                 "id=", new_event.get("id"),
                 "video_id=", new_event.get("video_id"),
                 "label=", new_event.get("label"),
@@ -1131,7 +1133,7 @@ def _write_attire_event_common(
 
             ok_notif = _should_publish_notif(sid, vtype)
 
-            _dprint("[NOTIF] should_publish =",
+            print("[NOTIF] should_publish =",
                 ok_notif,
                 "sid=", sid,
                 "type=", vtype)
@@ -1140,7 +1142,7 @@ def _write_attire_event_common(
                 with ATTIRE_NOTIF_SUBS_LOCK:
                     sub_count = len(ATTIRE_NOTIF_SUBS)
 
-                _dprint("[NOTIF] publishing to subscribers:", sub_count)
+                print("[NOTIF] publishing to subscribers:", sub_count)
 
                 payload = {
                     "id": new_event["id"],
@@ -1151,11 +1153,11 @@ def _write_attire_event_common(
                     "event_id": new_event["id"],
                 }
 
-                _dprint("[NOTIF] payload:", payload)
+                print("[NOTIF] payload:", payload)
 
                 _publish_attire_notification(payload)
             else:
-                _dprint("[NOTIF] notification suppressed",
+                print("[NOTIF] notification suppressed",
                     "sid=", sid,
                     "type=", vtype)
         except Exception:
@@ -1628,13 +1630,13 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
     with NOTIF_LOCK:
         cfg = dict(ATTIRE_NOTIF_CFG)
 
-    _dprint("[NOTIF] _should_publish_notif called",
+    print("[NOTIF] _should_publish_notif called",
           "source_id=", source_id,
           "violation_type=", violation_type,
           "cfg=", cfg)
 
     if not cfg.get("enabled", True):
-        _dprint("[NOTIF] blocked: notifications disabled")
+        print("[NOTIF] blocked: notifications disabled")
         return False
 
     cd = float(cfg.get("cooldown_sec", 30) or 0)
@@ -1645,7 +1647,7 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
         last = ATTIRE_NOTIF_LAST_TS.get(key, 0.0)
         diff = now - last
 
-        _dprint("[NOTIF] cooldown check",
+        print("[NOTIF] cooldown check",
               "key=", key,
               "last=", last,
               "now=", now,
@@ -1653,12 +1655,12 @@ def _should_publish_notif(source_id: str, violation_type: str) -> bool:
               "cooldown=", cd)
 
         if cd > 0 and diff < cd:
-            _dprint("[NOTIF] blocked by cooldown")
+            print("[NOTIF] blocked by cooldown")
             return False
 
         ATTIRE_NOTIF_LAST_TS[key] = now
 
-    _dprint("[NOTIF] allowed")
+    print("[NOTIF] allowed")
     return True
 
 def _publish_attire_notification(payload: dict) -> None:
@@ -1701,8 +1703,8 @@ THUMB_TTL_SEC = 8.0
 # ----------------------------
 # Live session janitor (idle cleanup)
 # ----------------------------
-IDLE_TIMEOUT_SEC = 60          # stop sessions if no viewer for 60s
-JANITOR_INTERVAL_SEC = 10      # check every 10s
+IDLE_TIMEOUT_SEC = 20          # stop sessions if no viewer for 60s
+JANITOR_INTERVAL_SEC = 5       # check every 10s
 
 def _janitor():
     while True:
@@ -3517,15 +3519,19 @@ def rtsp_live_detections(rtsp_id: str):
     with LIVE_LOCK:
         sess = LIVE_SESSIONS.get(rtsp_id)
         if not sess:
-            _ensure_live_slot(rtsp_id)
-            sess = LiveVideoSession(rtsp_id, url, stream_fps=saved_stream_fps, detect_fps=saved_detect_fps)
-            LIVE_SESSIONS[rtsp_id] = sess
-        else:
-            fps_changed = (float(sess.stream_fps) != float(saved_stream_fps)) or (float(sess.detect_fps) != float(saved_detect_fps))
-            sess.stream_fps = saved_stream_fps
-            sess.detect_fps = saved_detect_fps
-            if fps_changed:
-                sess._next_detect_ts = 0.0
+            return {
+                "ts": int(time.time()),
+                "fps": 0,
+                "resolution": [0, 0],
+                "detections": [],
+                "detail": "No active RTSP session"
+            }
+
+        fps_changed = (float(sess.stream_fps) != float(saved_stream_fps)) or (float(sess.detect_fps) != float(saved_detect_fps))
+        sess.stream_fps = saved_stream_fps
+        sess.detect_fps = saved_detect_fps
+        if fps_changed:
+            sess._next_detect_ts = 0.0
 
         _touch_session(sess)
         sess.start()
@@ -5080,10 +5086,10 @@ def set_attire_notifications_cfg(payload: dict = Body(...), user=Depends(get_cur
 async def attire_notifications_stream(request: Request, token: str = ""):
     user = get_current_user_from_token(token)
     if not user:
-        _dprint("[NOTIF] SSE rejected: invalid token")
+        print("[NOTIF] SSE rejected: invalid token")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    _dprint("[NOTIF] SSE connect attempt by user:", user.get("username") if isinstance(user, dict) else user)
+    print("[NOTIF] SSE connect attempt by user:", user.get("username") if isinstance(user, dict) else user)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=50)
     loop = asyncio.get_running_loop()
@@ -5091,7 +5097,7 @@ async def attire_notifications_stream(request: Request, token: str = ""):
 
     with ATTIRE_NOTIF_SUBS_LOCK:
         ATTIRE_NOTIF_SUBS.add(sub)
-        _dprint("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
+        print("[NOTIF] SSE subscriber added. total =", len(ATTIRE_NOTIF_SUBS))
 
     async def gen():
         try:
@@ -5103,22 +5109,22 @@ async def attire_notifications_stream(request: Request, token: str = ""):
 
             while True:
                 if await request.is_disconnected():
-                    _dprint("[NOTIF] SSE client disconnected")
+                    print("[NOTIF] SSE client disconnected")
                     break
 
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=10.0)
-                    _dprint("[NOTIF] SSE sending plain message:", item)
+                    print("[NOTIF] SSE sending plain message:", item)
                     yield f"data: {json.dumps(item)}\n\n"
 
                 except asyncio.TimeoutError:
-                    _dprint("[NOTIF] SSE sending ping")
+                    print("[NOTIF] SSE sending ping")
                     yield ": ping\n\n"
 
         finally:
             with ATTIRE_NOTIF_SUBS_LOCK:
                 ATTIRE_NOTIF_SUBS.discard(sub)
-                _dprint("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
+                print("[NOTIF] SSE subscriber removed. total =", len(ATTIRE_NOTIF_SUBS))
 
     origin = request.headers.get("origin", "")
     sse_headers = {
