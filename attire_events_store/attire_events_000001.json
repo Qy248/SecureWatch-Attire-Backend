@@ -10752,34 +10752,6 @@
     "storage_shard": 1
   },
   {
-    "id": "rtsp-cam201-d89d7e6c",
-    "video_id": "cam201",
-    "video_name": "B100D",
-    "label": "slippers",
-    "view": "normal",
-    "ts": 1775465645,
-    "last_seen_ts": 1775465656,
-    "duplicate_hits": 1,
-    "max_similarity": 0.7460832407275979,
-    "conf": 0.513077437877655,
-    "severity": "High",
-    "evidence_url": "/violations/rtsp/cam201/shard_000001/1775465656_460241a9.jpg",
-    "status": "Pending",
-    "resolved_ts": null,
-    "location": "normal",
-    "notes": "",
-    "source": "Live RTSP",
-    "person_id": null,
-    "bbox_xyxy": [
-      303.05926513671875,
-      130.4344024658203,
-      325.98809814453125,
-      140.94483947753906
-    ],
-    "storage_shard": 1,
-    "last_conf": 0.513077437877655
-  },
-  {
     "id": "rtsp-cam201-56e269ff",
     "video_id": "cam201",
     "video_name": "B100D",
@@ -13253,34 +13225,6 @@
     ],
     "storage_shard": 1,
     "last_conf": 0.5588025450706482
-  },
-  {
-    "id": "rtsp-cam201-78f78e94",
-    "video_id": "cam201",
-    "video_name": "B100D",
-    "label": "shorts",
-    "view": "normal",
-    "ts": 1775470115,
-    "last_seen_ts": 1775470135,
-    "duplicate_hits": 1,
-    "max_similarity": 0.8993662181471314,
-    "conf": 0.695448100566864,
-    "severity": "High",
-    "evidence_url": "/violations/rtsp/cam201/shard_000001/1775470156_52873423.jpg",
-    "status": "Pending",
-    "resolved_ts": null,
-    "location": "normal",
-    "notes": "",
-    "source": "Live RTSP",
-    "person_id": null,
-    "bbox_xyxy": [
-      286.60028076171875,
-      101.45911407470703,
-      310.39056396484375,
-      131.667724609375
-    ],
-    "storage_shard": 1,
-    "last_conf": 0.695448100566864
   },
   {
     "id": "rtsp-cam201-125514e0",

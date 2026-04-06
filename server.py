@@ -421,6 +421,69 @@ def _get_enabled_for_video(video_id: str) -> bool:
         return bool(cfg.get("enabled"))
     return True
 
+# --- View Mode persistent store ---
+VIEW_MODE_PATH = str(HERE / "attire_view_mode.json")
+VIEW_MODE_LOCK = threading.Lock()
+# video_id -> {"mode": "auto" | "normal" | "fisheye"}
+VIEW_MODE_BY_VIDEO = {}
+
+def _load_view_mode_file() -> dict:
+    try:
+        if os.path.exists(VIEW_MODE_PATH):
+            with open(VIEW_MODE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _save_view_mode_file(data: dict) -> None:
+    try:
+        tmp = VIEW_MODE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, VIEW_MODE_PATH)
+    except Exception:
+        pass
+
+with VIEW_MODE_LOCK:
+    VIEW_MODE_BY_VIDEO = _load_view_mode_file()
+
+def _normalize_view_mode(mode: str) -> str:
+    m = str(mode or "auto").strip().lower()
+    if m not in {"auto", "normal", "fisheye"}:
+        return "auto"
+    return m
+
+def _get_view_mode_for_video(video_id: str) -> str:
+    with VIEW_MODE_LOCK:
+        cfg = VIEW_MODE_BY_VIDEO.get(video_id) or {}
+    if isinstance(cfg, dict):
+        return _normalize_view_mode(cfg.get("mode", "auto"))
+    return "auto"
+
+def _set_view_mode_for_video(video_id: str, mode: str) -> str:
+    mode = _normalize_view_mode(mode)
+    with VIEW_MODE_LOCK:
+        VIEW_MODE_BY_VIDEO[video_id] = {"mode": mode}
+        _save_view_mode_file(VIEW_MODE_BY_VIDEO)
+    return mode
+
+def _resolve_effective_fisheye(video_id: str, detected_is_fisheye: bool) -> tuple[bool, str]:
+    """
+    Returns:
+      (effective_is_fisheye, mode_used)
+    mode_used is one of: auto / normal / fisheye
+    """
+    saved_mode = _get_view_mode_for_video(video_id)
+
+    if saved_mode == "normal":
+        return False, "normal"
+    if saved_mode == "fisheye":
+        return True, "fisheye"
+
+    return bool(detected_is_fisheye), "auto"
+
 # --- Violation Types persistent store (global) ---
 VIOLATION_TYPES_PATH = str(HERE / "attire_violation_types.json")
 VIOLATION_TYPES_LOCK = threading.Lock()
@@ -633,6 +696,31 @@ def _event_evidence_abs_path(ev: dict) -> str:
     if not rel:
         return ""
     return os.path.join(VIOLATIONS_DIR, rel)
+
+def _cleanup_missing_evidence_events() -> int:
+    """
+    Remove any attire event whose evidence file no longer exists.
+    This prevents frontend black/empty violation cards.
+    """
+    removed = 0
+
+    with ATTIRE_EVENTS_LOCK:
+        events = _load_all_attire_events()
+        if not events:
+            return 0
+
+        kept = []
+        for ev in events:
+            p = _event_evidence_abs_path(ev)
+            if p and os.path.isfile(p):
+                kept.append(ev)
+            else:
+                removed += 1
+
+        if removed > 0:
+            _rewrite_all_attire_events(kept)
+
+    return removed
 
 def _prune_attire_events_by_retention() -> int:
     if not _is_retention_enabled():
@@ -1061,24 +1149,50 @@ def _dedupe_recent_attire_events_periodic() -> int:
         if not events:
             return 0
 
-        recent = [dict(e) for e in events if int(e.get("ts", 0) or 0) >= cutoff]
-        if len(recent) < 2:
-            return 0
+        # 1) First remove broken events whose files are already missing
+        valid_events = []
+        for ev in events:
+            img_path = _event_evidence_abs_path(ev)
+            if img_path and os.path.isfile(img_path):
+                valid_events.append(ev)
+            else:
+                removed.append(ev)
 
-        id_to_event = {str(e.get("id")): dict(e) for e in events}
+        if not valid_events:
+            _rewrite_all_attire_events([])
+            return len(removed)
+
+        recent = [dict(e) for e in valid_events if int(e.get("ts", 0) or 0) >= cutoff]
+        if len(recent) < 2:
+            if removed:
+                _rewrite_all_attire_events(valid_events)
+            return len(removed)
+
+        id_to_event = {str(e.get("id")): dict(e) for e in valid_events}
         group_keepers = {}
+        removed_ids = set(str(ev.get("id")) for ev in removed)
 
         recent_sorted = sorted(recent, key=lambda e: int(e.get("ts", 0) or 0))
         for ev in recent_sorted:
+            ev_id = str(ev.get("id"))
+            if ev_id in removed_ids:
+                continue
+
             if ev.get("status") == "Resolved":
                 continue
+
             img_path = _event_evidence_abs_path(ev)
             if not img_path or not os.path.isfile(img_path):
+                removed.append(ev)
+                removed_ids.add(ev_id)
                 continue
 
             img = cv2.imread(img_path)
             if img is None or img.size == 0:
+                removed.append(ev)
+                removed_ids.add(ev_id)
                 continue
+
             crop_hash = _compute_difference_hash_uint64(img)
             color_hist = _compute_tiny_hsv_hist(img)
 
@@ -1095,6 +1209,7 @@ def _dedupe_recent_attire_events_periodic() -> int:
             for keeper in reversed(group_keepers.get(bucket, [])):
                 if abs(ts - int(keeper.get("ts", 0) or 0)) > int(DUPLICATE_TIME_WINDOW_SEC):
                     continue
+
                 sim = _hash_similarity_ratio(crop_hash, int(keeper.get("hash", 0) or 0))
 
                 keeper_bbox = keeper.get("bbox_xyxy")
@@ -1119,7 +1234,7 @@ def _dedupe_recent_attire_events_periodic() -> int:
 
             if matched_keeper is None:
                 group_keepers.setdefault(bucket, []).append({
-                    "id": str(ev.get("id")),
+                    "id": ev_id,
                     "hash": crop_hash,
                     "ts": ts,
                     "bbox_xyxy": ev.get("bbox_xyxy"),
@@ -1130,23 +1245,25 @@ def _dedupe_recent_attire_events_periodic() -> int:
             keeper_id = str(matched_keeper["id"])
             keeper_ev = dict(id_to_event.get(keeper_id) or {})
             if keeper_ev:
-                merged = _merge_duplicate_event_fields(
-                    keeper_ev,
-                    new_conf=ev.get("conf"),
-                    new_ts=ts,
-                    similarity=matched_sim,
-                    bbox_xyxy=ev.get("bbox_xyxy"),
-                    evidence_url=ev.get("evidence_url") or "",
+                keeper_ev["last_seen_ts"] = int(ts)
+                keeper_ev["duplicate_hits"] = int(keeper_ev.get("duplicate_hits", 0) or 0) + 1
+                keeper_ev["max_similarity"] = max(
+                    float(keeper_ev.get("max_similarity", 0.0) or 0.0),
+                    float(matched_sim or 0.0),
                 )
-                id_to_event[keeper_id] = merged
+
+                old_conf = float(keeper_ev.get("conf", -1.0) or -1.0)
+                new_conf = float(ev.get("conf", -1.0) or -1.0)
+                if new_conf > old_conf:
+                    keeper_ev["conf"] = new_conf
+
+                id_to_event[keeper_id] = keeper_ev
+
             removed.append(ev)
+            removed_ids.add(ev_id)
 
-        if not removed:
-            return 0
-
-        removed_ids = {str(ev.get("id")) for ev in removed}
         kept = []
-        for ev in events:
+        for ev in valid_events:
             eid = str(ev.get("id"))
             if eid in removed_ids:
                 continue
@@ -1154,6 +1271,7 @@ def _dedupe_recent_attire_events_periodic() -> int:
 
         _rewrite_all_attire_events(kept)
 
+    # remove files for removed records
     for ev in removed:
         _safe_remove_file(_event_evidence_abs_path(ev))
 
@@ -1271,27 +1389,33 @@ def _write_attire_event_common(
     evidence_url = f"/violations/{evidence_kind}/{source_id}/{shard_folder}/{filename}"
 
     if duplicate_hit is not None:
+        keeper_id = str(duplicate_hit.get("event_id") or "")
+
         with ATTIRE_EVENTS_LOCK:
             items = _load_all_attire_events()
             idx = next(
-                (i for i, e in enumerate(items) if str(e.get("id")) == str(duplicate_hit.get("event_id"))),
+                (i for i, e in enumerate(items) if str(e.get("id")) == keeper_id),
                 None
             )
+
             if idx is not None:
                 ev = dict(items[idx])
 
-                old_evidence_url = str(ev.get("evidence_url") or "")
-                old_evidence_path = _event_evidence_abs_path(ev)
-
-                merged = _merge_duplicate_event_fields(
-                    ev,
-                    new_conf=conf,
-                    new_ts=now_s,
-                    similarity=float(duplicate_hit.get("similarity", 0.0) or 0.0),
-                    bbox_xyxy=bbox_xyxy,
-                    evidence_url=evidence_url,
+                # Keep original keeper evidence file.
+                # Only update metadata so we know duplicate happened.
+                ev["last_seen_ts"] = int(now_s)
+                ev["duplicate_hits"] = int(ev.get("duplicate_hits", 0) or 0) + 1
+                ev["max_similarity"] = max(
+                    float(ev.get("max_similarity", 0.0) or 0.0),
+                    float(duplicate_hit.get("similarity", 0.0) or 0.0),
                 )
-                items[idx] = merged
+
+                old_conf = float(ev.get("conf", -1.0) or -1.0)
+                new_conf = float(conf) if conf is not None else -1.0
+                if new_conf > old_conf:
+                    ev["conf"] = new_conf
+
+                items[idx] = ev
                 _rewrite_all_attire_events(items)
 
                 _remember_duplicate_index(
@@ -1301,24 +1425,13 @@ def _write_attire_event_common(
                     track_id,
                     crop_hash,
                     now_s,
-                    str(merged.get("id")),
+                    keeper_id,
                     bbox_xyxy=bbox_xyxy,
                     color_hist=color_hist,
                 )
 
-                merged_evidence_url = str(merged.get("evidence_url") or "")
-                merged_evidence_path = _event_evidence_abs_path(merged)
-
-        # IMPORTANT:
-        # keep the file that the merged record is actually pointing to
-        if merged_evidence_url == evidence_url or merged_evidence_path == out_path:
-            # merged event adopted the NEW evidence file -> keep new file
-            if old_evidence_path and old_evidence_path != out_path and old_evidence_path != merged_evidence_path:
-                _safe_remove_file(old_evidence_path)
-        else:
-            # merged event kept the OLD evidence file -> delete the new temp duplicate file
-            _safe_remove_file(out_path)
-
+        # Always remove the newly created duplicate image
+        _safe_remove_file(out_path)
         return None
 
     new_event = {
@@ -1386,6 +1499,7 @@ def _write_attire_event_common(
                     "violation_type": vtype,
                     "timestamp": new_event["ts"],
                     "event_id": new_event["id"],
+                    "imageUrl": new_event.get("evidence_url") or "",
                 }
 
                 print("[NOTIF] payload:", payload)
@@ -1970,9 +2084,9 @@ GLOBAL_DETECTOR = None
 
 VIOLATIONS_DIR = str(HERE / "violations")
 os.makedirs(VIOLATIONS_DIR, exist_ok=True)
-# Serve saved evidence images (front-end can load via http://localhost:8000/violations/...)
 app.mount("/violations", StaticFiles(directory=VIOLATIONS_DIR), name="violations")
 _prune_attire_events_by_retention()
+_cleanup_missing_evidence_events()
 
 # ----------------------------
 # Helpers 
@@ -2846,6 +2960,8 @@ class LiveVideoSession:
         self._recent = deque(maxlen=50)
         self._next_detect_ts = 0.0
         self._is_fisheye = None
+        self._detected_is_fisheye = None
+        self._mode_used = "auto"
 
         self._dewarper = None
         self._dewarp_ver = -1
@@ -3028,11 +3144,16 @@ class LiveVideoSession:
                         reconnect_wait = 0.5
 
                     # Detect fisheye ONCE, only when we have a REAL frame
-                    if self._is_fisheye is None:
+                    if self._detected_is_fisheye is None:
                         try:
-                            self._is_fisheye = bool(is_fisheye(frame))
+                            self._detected_is_fisheye = bool(is_fisheye(frame))
                         except Exception:
-                            self._is_fisheye = False
+                            self._detected_is_fisheye = False
+
+                    self._is_fisheye, _ = _resolve_effective_fisheye(
+                        self.video_id,
+                        bool(self._detected_is_fisheye),
+                    )
 
                     self._frame_idx += 1
                     # ----------------------------
@@ -3354,6 +3475,7 @@ class LiveVideoSession:
 def get_attire_events(video_id: str = "", limit: int = 1000):
     _prune_attire_events_by_retention()
     _dedupe_recent_attire_events_periodic()
+    _cleanup_missing_evidence_events()
 
     with ATTIRE_EVENTS_LOCK:
         items = _load_all_attire_events()
@@ -3593,15 +3715,22 @@ def offline_video_meta(video_id: str):
     ok, frame = cap.read()
     cap.release()
 
-    if not ok or frame is None:
-        return {"video_id": video_id, "is_fisheye": False}
+    detected = False
+    if ok and frame is not None:
+        try:
+            detected = bool(is_fisheye(frame))
+        except Exception:
+            detected = False
 
-    try:
-        fisheye = bool(is_fisheye(frame))
-    except Exception:
-        fisheye = False
+    effective, mode_used = _resolve_effective_fisheye(video_id, detected)
 
-    return {"video_id": video_id, "is_fisheye": fisheye}
+    return {
+        "video_id": video_id,
+        "is_fisheye": effective,
+        "detected_is_fisheye": detected,
+        "mode": _get_view_mode_for_video(video_id),
+        "mode_used": mode_used,
+    }
 
 @app.get("/api/offline/labels")
 def get_video_labels():
@@ -3678,15 +3807,23 @@ def rtsp_meta(rtsp_id: str):
             if not cap.grab():
                 break
         ok, frame = cap.read()
-        if not ok or frame is None:
-            return {"video_id": rtsp_id, "is_fisheye": False}
 
-        try:
-            fisheye = bool(is_fisheye(frame))
-        except Exception:
-            fisheye = False
+        detected = False
+        if ok and frame is not None:
+            try:
+                detected = bool(is_fisheye(frame))
+            except Exception:
+                detected = False
 
-        return {"video_id": rtsp_id, "is_fisheye": fisheye}
+        effective, mode_used = _resolve_effective_fisheye(rtsp_id, detected)
+
+        return {
+            "video_id": rtsp_id,
+            "is_fisheye": effective,
+            "detected_is_fisheye": detected,
+            "mode": _get_view_mode_for_video(rtsp_id),
+            "mode_used": mode_used,
+        }
     finally:
         cap.release()
 
@@ -3809,9 +3946,11 @@ def rtsp_snapshot_dewarp(rtsp_id: str):
 
         # Detect if fisheye
         try:
-            fisheye = bool(is_fisheye(frame))
+            detected = bool(is_fisheye(frame))
         except Exception:
-            fisheye = False
+            detected = False
+
+        fisheye, _mode_used = _resolve_effective_fisheye(rtsp_id, detected)
 
         # If not fisheye, just return a normal snapshot
         if not fisheye:
@@ -4088,9 +4227,11 @@ def snapshot_dewarp(video_id: str):
 
     # IMPORTANT: detect fisheye first
     try:
-        fisheye = bool(is_fisheye(frame))
+        detected = bool(is_fisheye(frame))
     except Exception:
-        fisheye = False
+        detected = False
+
+    fisheye, _mode_used = _resolve_effective_fisheye(video_id, detected)
 
     # Normal video -> return normal snapshot, no dewarp
     if not fisheye:
@@ -5381,3 +5522,29 @@ async def attire_notifications_stream(request: Request, token: str = ""):
         headers=sse_headers,
     )
 
+# --- Normal/Fisheye view mode ---
+@app.get("/api/attire/view-mode/{video_id}")
+def get_attire_view_mode(video_id: str):
+    return {
+        "video_id": video_id,
+        "mode": _get_view_mode_for_video(video_id),
+    }
+
+@app.post("/api/attire/view-mode/{video_id}")
+def set_attire_view_mode(video_id: str, body: dict = Body(...)):
+    mode = _normalize_view_mode(body.get("mode", "auto"))
+    mode = _set_view_mode_for_video(video_id, mode)
+
+    # Apply immediately to active session if exists
+    with LIVE_LOCK:
+        sess = LIVE_SESSIONS.get(video_id)
+        if sess:
+            sess._last_mosaic = None
+            sess._last_tile_meta = None
+            sess._frame_idx = 0
+
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "mode": mode,
+    }
