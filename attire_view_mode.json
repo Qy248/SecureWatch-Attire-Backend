@@ -4,5 +4,20 @@
   },
   "cam201": {
     "mode": "normal"
+  },
+  "cam197": {
+    "mode": "fisheye"
+  },
+  "cam194": {
+    "mode": "normal"
+  },
+  "cam196": {
+    "mode": "fisheye"
+  },
+  "vid-79223a3d": {
+    "mode": "fisheye"
+  },
+  "cam198": {
+    "mode": "normal"
   }
 }
