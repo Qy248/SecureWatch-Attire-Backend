@@ -2292,29 +2292,6 @@ def _make_2x2_mosaic(view_items, tile_size=(640, 360), labels_by_name=None):
 
     return mosaic, tile_meta
 
-def _build_highres_planar_from_fisheye(full_frame, view_name, out_shape=EVIDENCE_VIEW_SHAPE):
-    cfg = next((c for c in CURRENT_VIEW_CONFIGS if c.get("name") == view_name), None)
-    if cfg is None:
-        return None
-
-    cropped, side = _center_crop_square(full_frame)
-    out_h, out_w = out_shape
-
-    map_x, map_y = build_fisheye_remap(
-        input_shape=(side, side),
-        output_shape=(out_h, out_w),
-        input_fov_deg=INPUT_FOV_DEG,
-        output_fov_deg=float(cfg.get("fov_deg", cfg.get("fov", 90.0))),
-        yaw_deg=float(cfg.get("yaw_deg", cfg.get("yaw", 0.0))),
-        pitch_deg=float(cfg.get("pitch_deg", cfg.get("pitch", 0.0))),
-        roll_deg=float(cfg.get("roll_deg", cfg.get("roll", 0.0))),
-    )
-    planar = cv2.remap(cropped, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-
-    if view_name == "right_seats":
-        planar = cv2.rotate(planar, cv2.ROTATE_180)
-    return planar
-
 # --- Label + detection extraction helpers ---
 def _label_to_violation(label: str):
     s = (label or "").lower()
@@ -3271,31 +3248,8 @@ class LiveVideoSession:
                                             if tile is not None:
                                                 x0, y0, tw, th = int(tile["x0"]), int(tile["y0"]), int(tile["w"]), int(tile["h"])
                                                 tile_frame = frame_to_show[y0:y0+th, x0:x0+tw].copy()
-
-                                                # default fallback = current behavior
+                                                bbox_use = info["local_bbox"]  # local coords within tile
                                                 frame_use = tile_frame
-                                                bbox_use = info["local_bbox"]
-
-                                                # build high-res planar only for this event view
-                                                hi_planar = _build_highres_planar_from_fisheye(frame, vname)
-
-                                                if hi_planar is not None and getattr(hi_planar, "size", 0) != 0:
-                                                    hh, hw = hi_planar.shape[:2]
-
-                                                    # map local tile bbox -> high-res planar bbox
-                                                    lx1, ly1, lx2, ly2 = info["local_bbox"]
-                                                    sx_planar = hw / float(max(1, tw))
-                                                    sy_planar = hh / float(max(1, th))
-
-                                                    bbox_hi = [
-                                                        float(lx1) * sx_planar,
-                                                        float(ly1) * sy_planar,
-                                                        float(lx2) * sx_planar,
-                                                        float(ly2) * sy_planar,
-                                                    ]
-
-                                                    frame_use = hi_planar
-                                                    bbox_use = bbox_hi
                                             else:
                                                 frame_use = frame_to_show
                                                 bbox_use = info["bbox"]
