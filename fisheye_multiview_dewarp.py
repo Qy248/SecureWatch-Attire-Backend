@@ -9,11 +9,10 @@ import numpy as np
 # pitch_deg : tilt up/down (0 = horizontal, negative = look more down)
 # fov_deg   : zoom (bigger = wider & more distorted, smaller = more zoom & flatter)
 
+# [DEFAULT] Fisheye dewarp parameters
 VIEW_CONFIGS = [
-    # Try to make this see the entrance (bottom-right of fisheye)
+    # Entrance and Corridor zones
     {"name": "entrance",    "roll_deg":  -105,  "pitch_deg": -70, "fov_deg": 40},
-
-    # Corridor / walking path in front of entrance
     {"name": "corridor",    "roll_deg": -100, "pitch_deg": -55, "fov_deg": 70},
 
     # Left & right seating zones

@@ -10,7 +10,7 @@ import torch
 from ultralytics import YOLO
 
 
-# Must match the class order used in your attire_data.yaml during training
+# Must match the class order used in attire_data.yaml during training
 CLASS_NAMES = [
     "short_sleeve",
     "long_sleeve",

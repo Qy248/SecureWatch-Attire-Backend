@@ -33,6 +33,7 @@ ALLOWED_ORIGINS = [
     "https://qy248.github.io",
     "https://jinxuan-wong.github.io",
     "https://tarumtfocslab.github.io",
+    "https://securewatchqyjx.qzz.io",
 ]
 
 app = FastAPI()

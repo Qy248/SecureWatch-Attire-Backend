@@ -152,51 +152,219 @@
     ]
   },
   "cam192": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam201": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam196": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam194": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "vid-79223a3d": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "vid-5f1c232c": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam195": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "vid-139967c8": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam193": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam197": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "vid-45af9cbc": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   },
   "cam198": {
-    "enabled": false,
-    "schedules": []
+    "enabled": true,
+    "schedules": [
+      {
+        "id": "1",
+        "startTime": "08:00",
+        "endTime": "18:00",
+        "enabled": true,
+        "days": [
+          "Mon",
+          "Tue",
+          "Wed",
+          "Thu",
+          "Fri"
+        ]
+      }
+    ]
   }
 }

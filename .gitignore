@@ -10,16 +10,14 @@ venv/
 .idea/
 .vscode/
 
-outputs/
-runs/
-snapshots/
+violations/
 uploads/
-tmp/
 
 *.jpg
 *.png
 *.mp4
 *.zip
 
-yolov8*.pt
 desktop.ini
+
+AttireDetectionTrainingPipeline/
